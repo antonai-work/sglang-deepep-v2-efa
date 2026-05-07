@@ -34,25 +34,36 @@ ARG DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # -----------------------------------------------------------------------------
-# SGLang overlay. Wave 29 will:
-#   1. Confirm 0.5.6.post2 still imports cleanly on the v0.2.5 cu13 base.
-#   2. Add the DeepEP V2 adapter from upstream sgl-project/sglang#24443.
-#   3. Bake the DeepGEMM JIT cache for Qwen3-30B-A3B-FP8 so first
-#      /v1/chat/completions returns in <10 s (V1 suffered a 10-20 min stall).
+# SGLang overlay — Wave 32 version bump.
+#
+# Why 0.5.11: Upstream released 0.5.11 on 2026-05-05 with CUDA 13 + torch 2.11
+# as the DEFAULT build matrix (tracking issue sgl-project/sglang#21498,
+# upgrade PR sgl-project/sglang#21247, Dockerfile prep #23593, sgl-kernel prep
+# #24162). Before 0.5.11, sgl_kernel was built against torch 2.9 C10 ABI (the
+# `i` variant of c10_cuda_check_implementation). 0.5.11 ships sglang-kernel
+# 0.4.2 whose common_ops.abi3.so uses the torch 2.11 ABI (`j` variant —
+# empirically verified via nm -D on /tmp/sgl-k4.2/sgl_kernel/sm90/common_ops).
+#
+# Prior attempt (v0.2.5 wave 29d): sglang 0.5.6.post2 imported but sgl_kernel
+# failed at undefined symbol _ZN3c104cuda29c10_cuda_check_implementationEiPKcS2_ib
+# (the 2.9 ABI) on our torch 2.11 base. Bumping to 0.5.11 resolves this.
+#
+# Note: `sgl-kernel` was renamed to `sglang-kernel` between 0.5.6 and 0.5.11.
 # -----------------------------------------------------------------------------
-ARG SGLANG_VERSION=0.5.6.post2
+ARG SGLANG_VERSION=0.5.11
 
 # Recipe (proven via docker-run smoke on v0.2.5 base):
-#   1. Install sglang code only (--no-deps), skipping its torch==2.9.1 hard pin
+#   1. Install sglang code only (--no-deps), skipping its torch hard pin
 #   2. Compute sglang's transitive deps MINUS torch/flashinfer/torchvision/etc
 #      via importlib.metadata.requires('sglang')
-#   3. Install that filtered dep list normally (pip resolves their transitives)
+#   3. Install that filtered dep list normally (pip resolves their transitives
+#      — including sglang-kernel==0.4.2 with the torch 2.11 ABI)
 #   4. Force-reinstall nvidia-nccl-cu13 + nvidia-nvshmem-cu13 to restore v0.2.5
 #      versions (a deep transitive may have pinned older 2.28.9 / 3.4.5)
 #
-# Why: sglang[all] hard-pins torch==2.9.1 (cu12 wheel) which shatters the
-# v0.2.5 cu13 invariant (EVIDENCE-LEDGER Wave 7d #1). This recipe preserves
-# torch 2.11.0+cu130 and keeps deep_ep._C.so ABI intact.
+# Why the filter: sglang's requires_dist still hard-pins torch==2.11.0 and
+# torchao / torchaudio / torchcodec which would overwrite our base install.
+# The cu13 invariant (EVIDENCE-LEDGER Wave 7d #1) forbids this.
 RUN pip install --no-cache-dir --break-system-packages --no-deps \
       "sglang==${SGLANG_VERSION}"
 
@@ -80,8 +91,9 @@ LABEL org.opencontainers.image.title="sglang-deepep-v2-efa" \
       org.opencontainers.image.description="SGLang + DeepEP V2 + AWS EFA MoE inference cascade (Wave 29 pending)." \
       org.opencontainers.image.source="https://github.com/antonai-work/sglang-deepep-v2-efa" \
       org.opencontainers.image.licenses="MIT" \
-      status.wave="29-pending" \
+      status.wave="32" \
       deepep.branch="aws-efa-auto-qp-cap-v2" \
       deepep.sha="146cc356aa00c39ac1590c05775e05b0f031e70c" \
       deepep.pr="612" \
+      sglang.version="0.5.11" \
       sglang.upstream_pr="24443"
