@@ -68,8 +68,11 @@ RUN pip install --no-cache-dir --break-system-packages --no-deps \
       ninja psutil packaging filelock networkx \
       starlette sniffio anyio h11 httptools websockets \
       watchfiles python-dotenv click colorama typing_inspect \
-      'email-validator' annotated-types nest-asyncio \
-      IPython
+      'email-validator' annotated-types nest-asyncio
+
+# Install IPython with deps (traitlets, jedi, etc. - all pure-python,
+# won't touch torch/cuda). sglang.utils imports IPython.display.
+RUN pip install --no-cache-dir --break-system-packages IPython
 
 # NOTE: no nvidia-nccl-cu13 or nvidia-nvshmem-cu13 guard needed. The
 # --no-deps sglang install never touched them; the base's cu13 stack
