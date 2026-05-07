@@ -42,17 +42,37 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # -----------------------------------------------------------------------------
 ARG SGLANG_VERSION=0.5.6.post2
 
-# Minimal overlay for Wave 29 cross-node smoke. Full DeepEP V2 adapter
-# (sgl-project/sglang#24443) + DeepGEMM JIT cache baking TBD.
-RUN pip install --no-cache-dir --break-system-packages "sglang[all]==${SGLANG_VERSION}"
+# SGLang 0.5.6.post2 hard-pins torch==2.9.1 (cu12 wheel) which shatters
+# the v0.2.5 base's cu13 invariant. Install --no-deps and curate the
+# runtime dep list to keep torch 2.11.0+cu130 intact.
+#
+# Invariant (EVIDENCE-LEDGER Wave 7d #1): torch silently pins nvidia-nccl
+# + nvidia-nvshmem. Never let sglang's torch 2.9 in. The --no-deps install
+# below preserves the base's cu13 stack wholesale.
+RUN pip install --no-cache-dir --break-system-packages --no-deps \
+      "sglang==${SGLANG_VERSION}"
 
-# Guard torch/nccl/nvshmem to match v0.2.5 base (cu13-unified stack).
-# Any torch upgrade silently re-installs nvidia-nccl/nvshmem wheels.
-ARG NVIDIA_NCCL_PIN=2.30.4
-ARG NVSHMEM_PIN=3.4.5
-RUN pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
-      "nvidia-nccl-cu13==${NVIDIA_NCCL_PIN}" \
-      "nvidia-nvshmem-cu13==${NVSHMEM_PIN}"
+# Non-torch runtime deps sglang imports. Curated from sgl-project/sglang
+# pyproject.toml minus {torch*, flashinfer*, nvidia-*-cu12, triton}.
+# Each is pinned to what sglang 0.5.6 expects; no version to let pip pick
+# the latest compatible with torch 2.11.
+RUN pip install --no-cache-dir --break-system-packages --no-deps \
+      tqdm fastapi 'uvicorn[standard]' psutil orjson pydantic pydantic_core \
+      pyzmq interegular lark outlines xgrammar requests aiohttp httpx hf-xet \
+      urllib3 charset-normalizer idna certifi \
+      transformers tokenizers safetensors huggingface_hub datasets blobfile \
+      modelscope einops scipy python-multipart uvloop cloudpickle prometheus-client \
+      anthropic openai litellm numba compressed-tensors msgpack-numpy msgspec msgpack \
+      dill multiprocess llguidance partial_json_parser pybase64 \
+      soundfile sentencepiece torchao torch_memory_saver \
+      ninja psutil packaging filelock networkx \
+      starlette sniffio anyio h11 httptools websockets \
+      watchfiles python-dotenv click colorama typing_inspect \
+      'email-validator' annotated-types nest-asyncio
+
+# NOTE: no nvidia-nccl-cu13 or nvidia-nvshmem-cu13 guard needed. The
+# --no-deps sglang install never touched them; the base's cu13 stack
+# is untouched.
 
 ENV PYTHONPATH=/opt
 
