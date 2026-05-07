@@ -42,9 +42,17 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # -----------------------------------------------------------------------------
 ARG SGLANG_VERSION=0.5.6.post2
 
-# TODO (Wave 29): install sglang + any SGLang-specific deep_ep adapter and
-# re-pin torch/nccl/nvshmem to match the v0.2.5 base (see vllm-deepep-v2-efa
-# Dockerfile for the reference pin-guard sequence).
+# Minimal overlay for Wave 29 cross-node smoke. Full DeepEP V2 adapter
+# (sgl-project/sglang#24443) + DeepGEMM JIT cache baking TBD.
+RUN pip install --no-cache-dir --break-system-packages "sglang[all]==${SGLANG_VERSION}"
+
+# Guard torch/nccl/nvshmem to match v0.2.5 base (cu13-unified stack).
+# Any torch upgrade silently re-installs nvidia-nccl/nvshmem wheels.
+ARG NVIDIA_NCCL_PIN=2.30.4
+ARG NVSHMEM_PIN=2.11.2
+RUN pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
+      "nvidia-nccl-cu13==${NVIDIA_NCCL_PIN}" \
+      "nvidia-nvshmem-cu13==${NVSHMEM_PIN}"
 
 ENV PYTHONPATH=/opt
 
