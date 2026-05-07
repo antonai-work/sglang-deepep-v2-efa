@@ -68,7 +68,8 @@ RUN pip install --no-cache-dir --break-system-packages --no-deps \
       ninja psutil packaging filelock networkx \
       starlette sniffio anyio h11 httptools websockets \
       watchfiles python-dotenv click colorama typing_inspect \
-      'email-validator' annotated-types nest-asyncio
+      'email-validator' annotated-types nest-asyncio \
+      IPython
 
 # NOTE: no nvidia-nccl-cu13 or nvidia-nvshmem-cu13 guard needed. The
 # --no-deps sglang install never touched them; the base's cu13 stack
