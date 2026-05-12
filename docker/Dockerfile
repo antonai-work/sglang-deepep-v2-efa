@@ -79,7 +79,7 @@ RUN set -eux; \
     SGL_ROOT=$(python3 -c "import sglang, os; print(os.path.dirname(os.path.dirname(os.path.dirname(sglang.__file__))))"); \
     echo "Applying PR #24443 at ${SGL_ROOT}"; \
     cd "${SGL_ROOT}"; \
-    patch -p1 --forward < /tmp/pr24443.patch; \
+    patch -p2 --forward < /tmp/pr24443.patch; \
     python3 -c "\
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPDispatcher; \
 assert hasattr(DeepEPDispatcher, '_build_v2_buffer'), 'PR #24443 patch did not land _build_v2_buffer'; \
