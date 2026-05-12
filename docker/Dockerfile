@@ -74,16 +74,21 @@ RUN pip install --no-cache-dir --break-system-packages --no-deps --force-reinsta
 # The patch adds `have_deepep_v2` probe + `_build_v2_buffer` classmethod
 # + `SGLANG_DEEPEP_USE_V2=1` env gate. Only touches one file.
 # -----------------------------------------------------------------------------
-COPY docker/pr24443-elasticbuffer.patch /tmp/pr24443.patch
+COPY docker/deepep-v2-patched.py /tmp/deepep-v2-patched.py
+# Whole-file replace: overwrite the installed deepep.py with the PR #24443
+# fork-branch version (dmvevents/sglang @ deepep-v2-elasticbuffer-support).
+# Simpler + more reliable than `patch` which has path-prefix + multi-hunk
+# edge cases. The file is self-contained; no other sglang module needs
+# touching since PR #24443 only adds an env-gate + classmethod.
 RUN set -eux; \
-    SGL_ROOT=$(python3 -c "import sglang, os; print(os.path.dirname(os.path.dirname(os.path.dirname(sglang.__file__))))"); \
-    echo "Applying PR #24443 at ${SGL_ROOT}"; \
-    cd "${SGL_ROOT}"; \
-    patch -p2 --forward < /tmp/pr24443.patch; \
+    DEST=$(python3 -c "import sglang, os; print(os.path.join(os.path.dirname(sglang.__file__), 'srt/layers/moe/token_dispatcher/deepep.py'))"); \
+    echo "Installing PR #24443 deepep.py at ${DEST}"; \
+    test -f "${DEST}"; \
+    cp /tmp/deepep-v2-patched.py "${DEST}"; \
     python3 -c "\
-from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPDispatcher; \
-assert hasattr(DeepEPDispatcher, '_build_v2_buffer'), 'PR #24443 patch did not land _build_v2_buffer'; \
-print('[OK] sglang V2 probe installed')"
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer; \
+assert hasattr(DeepEPBuffer, '_build_v2_buffer'), 'PR #24443 V2 probe missing on DeepEPBuffer'; \
+print('[OK] sglang V2 probe installed (PR #24443 whole-file)')"
 
 # Step 5: Verify DeepEP V2 exports are available for the probe.
 RUN python3 -c "\
