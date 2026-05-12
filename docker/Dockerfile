@@ -1,20 +1,28 @@
 # syntax=docker/dockerfile:1.10
 # =============================================================================
-# sglang-deepep-v2-efa - SGLang + DeepEP V2 + AWS EFA
+# sglang-deepep-v2-efa - SGLang + DeepEP V2 + AWS EFA (Wave 38.2)
 # =============================================================================
 #
-# STATUS: Wave 38.1 — SGLang installed from dmvevents/sglang fork branch
-# `deepep-v2-elasticbuffer-support` (HEAD ecb4b0e, upstream PR #24443 HEAD).
-# This branch carries the probe-plumbing that lets SGLang select DeepEP V2's
-# `ElasticBuffer` at buffer-build time when `SGLANG_DEEPEP_USE_V2=1` is set.
+# STATUS: Wave 38.2 — SGLang 0.5.11 from PyPI wheel + in-place patch applying
+# PR #24443 (DeepEP V2 ElasticBuffer probe). Pure-Python patch, no Rust
+# compiler needed (Wave 38.1 attempted to install from fork git source,
+# which triggered outlines_core Rust build + failed).
 #
-# Why the fork: upstream sgl-project/sglang PR #24443 is OPEN DRAFT with 0
-# maintainer reviews. Our fork branch is mergeable, rebased to main, and
-# is the only way to get native V2 routing in SGLang today.
+# Upstream PR: sgl-project/sglang#24443 "moe: add DeepEP V2 ElasticBuffer
+# support" — OPEN DRAFT, MERGEABLE, 0 maintainer reviews 2026-05-12.
+# HEAD ecb4b0e. Touches 1 file: python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+#
+# The patch adds:
+#   - `have_deepep_v2` probe (import deep_ep.ElasticBuffer)
+#   - `SGLANG_DEEPEP_USE_V2=1` env gate in `get_deepep_buffer`
+#   - `_build_v2_buffer` classmethod that constructs ElasticBuffer (MoE-shape)
+#
+# Without this patch, `--moe-a2a-backend deepep` instantiates V1 Buffer
+# which depends on NVSHMEM — Wave 29 + 38 CUDA illegal memory failures.
 #
 # Base cascade:
-#   nvidia/cuda:13.0.0 -> deepep-v2-efa-base:v0.2.5-sm90a  (patched NCCL + EFA + DeepEP V2)
-#   -> sglang-deepep-v2-efa:<tag>  (this repo, Wave 38.1)
+#   nvidia/cuda:13.0.0 -> deepep-v2-efa-base:v0.2.5-sm90a
+#   -> sglang-deepep-v2-efa:<tag> (this repo, Wave 38.2)
 #
 # Build:
 #   docker build -f docker/Dockerfile -t sglang-deepep-v2-efa:fast .
@@ -22,7 +30,7 @@
 # Sibling repos:
 #   - antonai-work/deepep-v2-efa-base      (base substrate)
 #   - antonai-work/vllm-deepep-v2-efa      (PROVEN native V2 via PR #41183)
-#   - antonai-work/trtllm-deepep-v2-efa    (shim-based V2, see Wave 30)
+#   - antonai-work/trtllm-deepep-v2-efa    (shim V2 via api-shim CompatBuffer)
 # =============================================================================
 
 ARG BUILD_MODE=fast
@@ -36,40 +44,15 @@ ARG DEBIAN_FRONTEND=noninteractive
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # -----------------------------------------------------------------------------
-# SGLang overlay — Wave 38.1: install from fork PR #24443.
-#
-# Upstream state (verified 2026-05-12):
-#   - sgl-project/sglang v0.5.11 released 2026-05-05, NO native V2 support
-#   - PR #24443 adds `SGLANG_DEEPEP_USE_V2=1` env + `_build_v2_buffer`
-#     classmethod in `sglang/srt/layers/moe/token_dispatcher/deepep.py`
-#   - PR state: OPEN DRAFT, MERGEABLE, 0 maintainer reviews, 7 days stale
-#   - HEAD: ecb4b0e (2026-05-08, lint fix)
-#
-# Fork repo: https://github.com/dmvevents/sglang (branch
-# deepep-v2-elasticbuffer-support) carries the PR #24443 head commit.
-#
-# The fork is installed from source (git clone + pip install --no-deps) so
-# the V2 probe-plumbing lands in the image. Without this, `--moe-a2a-backend
-# deepep` routes through V1 `Buffer` which depends on NVSHMEM — and we'd
-# hit Wave 29 / Wave 38 CUDA-illegal-memory failures.
+# SGLang 0.5.11 from PyPI (wheel — no Rust compiler needed).
 # -----------------------------------------------------------------------------
-ARG SGLANG_FORK_URL=https://github.com/dmvevents/sglang.git
-ARG SGLANG_FORK_BRANCH=deepep-v2-elasticbuffer-support
-ARG SGLANG_FORK_SHA=ecb4b0ed9f485ac6376d10facb8e5ded2f95d9b0
+ARG SGLANG_VERSION=0.5.11
 
-# Wave 38.1: install SGLang from fork branch with V2 ElasticBuffer probe.
-# --no-deps: skip framework-level torch pin (base image already has torch 2.11 cu130).
-# --no-build-isolation: reuse base-image torch so sgl-kernel's C++ ABI matches.
-RUN set -eux; \
-    git clone --depth 1 --branch "${SGLANG_FORK_BRANCH}" "${SGLANG_FORK_URL}" /tmp/sglang-fork; \
-    cd /tmp/sglang-fork; \
-    git checkout "${SGLANG_FORK_SHA}"; \
-    pip install --no-cache-dir --break-system-packages --no-deps \
-      /tmp/sglang-fork/python; \
-    rm -rf /tmp/sglang-fork
+# Step 1: Install sglang code only (--no-deps) to avoid torch downgrade.
+RUN pip install --no-cache-dir --break-system-packages --no-deps \
+      "sglang==${SGLANG_VERSION}"
 
-# Compute + install sglang's transitive deps, filtering out torch/flashinfer/triton
-# (would overwrite base-image cu13 stack).
+# Step 2: Compute + install filtered deps (exclude torch family + triton).
 RUN set -e; \
     python3 -c "\
 from importlib.metadata import requires; \
@@ -79,29 +62,39 @@ good = [r.split(';')[0].strip() for r in reqs if not any(r.lower().startswith(b.
 print('\n'.join(good))" > /tmp/sglang-deps.txt && \
     pip install --no-cache-dir --break-system-packages -r /tmp/sglang-deps.txt
 
-# EVIDENCE-LEDGER Wave 7d invariant #1: force-restore v0.2.5 cu13 stack.
-# sglang[deps] transitives can silently downgrade nvidia-nccl-cu13 -> cu12 and
-# nvidia-nvshmem-cu13 -> 3.4.5, breaking deep_ep _C.so ABI.
+# Step 3: Force-restore v0.2.5 cu13 stack (transitive deps may have downgraded)
 ARG NVIDIA_NCCL_PIN=2.30.4
 ARG NVSHMEM_PIN=3.6.5
 RUN pip install --no-cache-dir --break-system-packages --no-deps --force-reinstall \
       "nvidia-nccl-cu13==${NVIDIA_NCCL_PIN}" \
       "nvidia-nvshmem-cu13==${NVSHMEM_PIN}"
 
-# Verify deep_ep + sglang imports with V2 probe-plumbing present.
+# -----------------------------------------------------------------------------
+# Step 4: Apply PR #24443 patch to installed sglang deepep.py.
+# The patch adds `have_deepep_v2` probe + `_build_v2_buffer` classmethod
+# + `SGLANG_DEEPEP_USE_V2=1` env gate. Only touches one file.
+# -----------------------------------------------------------------------------
+COPY docker/pr24443-elasticbuffer.patch /tmp/pr24443.patch
+RUN set -eux; \
+    SGL_ROOT=$(python3 -c "import sglang, os; print(os.path.dirname(os.path.dirname(os.path.dirname(sglang.__file__))))"); \
+    echo "Applying PR #24443 at ${SGL_ROOT}"; \
+    cd "${SGL_ROOT}"; \
+    patch -p1 --forward < /tmp/pr24443.patch; \
+    python3 -c "\
+from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPDispatcher; \
+assert hasattr(DeepEPDispatcher, '_build_v2_buffer'), 'PR #24443 patch did not land _build_v2_buffer'; \
+print('[OK] sglang V2 probe installed')"
+
+# Step 5: Verify DeepEP V2 exports are available for the probe.
 RUN python3 -c "\
 import deep_ep; \
 assert hasattr(deep_ep, 'ElasticBuffer'), 'DeepEP V2 ElasticBuffer missing'; \
 import sglang; print(f'sglang={sglang.__version__}'); \
-from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPDispatcher; \
-assert hasattr(DeepEPDispatcher, '_build_v2_buffer'), 'PR #24443 V2 probe missing — fork branch may not be applied'; \
 print('[OK] sglang V2 ElasticBuffer routing ready')"
 
 # -----------------------------------------------------------------------------
-# V2 runtime ENV block (CRITICAL — overrides ambient base defaults when
-# the pod is spawned with its own env section that does not include these).
-# Mirrors the private integration tree:
-#   /home/ubuntu/deepep-v2-integration/integrations/sglang-deepep-v2/docker/Dockerfile
+# V2 runtime ENV block (activates PR #24443 gate + inherits EFA/NCCL-Gin
+# from base image). SGLANG_DEEPEP_USE_V2=1 is the new opt-in flag from the PR.
 # -----------------------------------------------------------------------------
 ENV DEEP_EP_BACKEND=nccl \
     DEEP_EP_USE_V2_SHIM=0 \
@@ -120,22 +113,20 @@ ENV DEEP_EP_BACKEND=nccl \
     EP_EFA_RDMA_GBS=25.0 \
     PYTHONPATH=/opt
 
-# No-shim invariant: since the fork adds native V2 probe, we do NOT need
-# api-shim. Assert /opt/api-shim does NOT exist to prevent accidental V1
-# shim activation.
-RUN test ! -e /opt/api-shim || (echo "ERROR: /opt/api-shim present but this overlay is native-V2"; exit 1)
+# No-shim invariant: the PR #24443 patch puts ElasticBuffer routing
+# directly inside SGLang, so we do NOT need api-shim.
+RUN test ! -e /opt/api-shim || (echo "ERROR: /opt/api-shim present but this overlay uses native PR #24443 patch"; exit 1)
 
 WORKDIR /opt
 
 LABEL org.opencontainers.image.title="sglang-deepep-v2-efa" \
-      org.opencontainers.image.description="SGLang + DeepEP V2 + AWS EFA MoE inference (Wave 38.1: fork PR #24443 native ElasticBuffer routing)." \
+      org.opencontainers.image.description="SGLang 0.5.11 + PR #24443 patch + DeepEP V2 + AWS EFA (Wave 38.2)." \
       org.opencontainers.image.source="https://github.com/antonai-work/sglang-deepep-v2-efa" \
       org.opencontainers.image.licenses="MIT" \
-      status.wave="38.1" \
+      status.wave="38.2" \
       deepep.branch="aws-efa-auto-qp-cap-v2" \
       deepep.sha="146cc356aa00c39ac1590c05775e05b0f031e70c" \
       deepep.pr="612" \
-      sglang.fork="dmvevents/sglang" \
-      sglang.fork_branch="deepep-v2-elasticbuffer-support" \
-      sglang.fork_sha="ecb4b0ed9f485ac6376d10facb8e5ded2f95d9b0" \
-      sglang.upstream_pr="24443"
+      sglang.version="0.5.11" \
+      sglang.upstream_pr="24443" \
+      sglang.patch="docker/pr24443-elasticbuffer.patch"

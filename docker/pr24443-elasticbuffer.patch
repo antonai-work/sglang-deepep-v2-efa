@@ -1,0 +1,273 @@
+diff --git a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+index f990d7d00172..241f1e61ba2d 100644
+--- a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
++++ b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+@@ -51,6 +51,22 @@
+ except ImportError:
+     use_deepep = False
+ 
++# DeepEP V2 introduces `ElasticBuffer` alongside the legacy `Buffer`
++# (deepseek-ai/DeepEP#605, merged 2026-04-29). On V2 both classes are
++# exported from `deep_ep.__init__`, so the existing `from deep_ep import
++# Buffer` surface above continues to work unchanged — `ElasticBuffer` is
++# an additional, MoE-shape ctor with auto-QP sizing that callers may
++# opt into. The probe below is orthogonal to `use_deepep` and does not
++# affect the default code path. V2 usage is further gated on
++# `SGLANG_DEEPEP_USE_V2=1`. Mirrors the `HAVE_DEEP_EP_V2` probe shape
++# already used in NVIDIA/Megatron-LM's `fused_a2a.py`.
++try:
++    from deep_ep import ElasticBuffer
++
++    have_deepep_v2 = True
++except ImportError:
++    have_deepep_v2 = False
++
+ from enum import Enum, IntEnum, auto
+ 
+ import torch
+@@ -166,6 +182,23 @@ def get_deepep_buffer(
+         cls._num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
+         cls._num_experts = num_experts
+ 
++        # Opt-in V2 path: construct `deep_ep.ElasticBuffer` instead of the
++        # legacy `deep_ep.Buffer`. V2 uses a MoE-shape ctor and infers the
++        # dispatch layout internally (no `get_dispatch_config` /
++        # `get_combine_config` / `get_nvl_buffer_size_hint` /
++        # `get_rdma_buffer_size_hint` calls). Gated behind an env var so
++        # the default code path is byte-identical to V1.
++        if have_deepep_v2 and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false"):
++            cls._buffer = cls._build_v2_buffer(
++                group,
++                hidden_size,
++                param_bytes,
++                deepep_mode,
++                num_max_dispatch_tokens_per_rank,
++                num_experts,
++            )
++            return cls._buffer
++
+         num_nvl_bytes, num_rdma_bytes = 0, 0
+         if deepep_mode.enable_normal():
+             hidden_bytes = hidden_size * param_bytes
+@@ -238,8 +271,73 @@ def get_deepep_buffer(
+         )
+         return cls._buffer
+ 
++    @classmethod
++    def _build_v2_buffer(
++        cls,
++        group: dist.ProcessGroup,
++        hidden_size: int,
++        param_bytes: int,
++        deepep_mode: DeepEPMode,
++        num_max_dispatch_tokens_per_rank: int,
++        num_experts: int,
++    ):
++        """Construct a DeepEP V2 `ElasticBuffer` for opt-in V2 usage.
++
++        DeepEP V2 (deepseek-ai/DeepEP#605) collapses the V1 NVL/RDMA
++        byte-pool ctor into a single MoE-shape ctor and derives the
++        internal buffer size from `num_max_tokens_per_rank`, `hidden`,
++        and `num_topk`. `num_allocated_qps=0` asks V2 to auto-size and
++        auto-cap the Queue-Pair budget — on AWS EFA this clamps to the
++        safe 128-slot GIN ring ceiling (see the EFA fast-path in
++        `deep_ep/buffers/elastic.py`).
++
++        V2 does not expose `get_dispatch_config` / `get_combine_config`
++        / `num_qps_per_rank`, so the matching V1 code above is skipped.
++        """
++        # Keep the num_tokens / num_topk source consistent with the V1
++        # low-latency path. For the normal path where
++        # `num_max_dispatch_tokens_per_rank == -1`, fall back to the
++        # SGLang env default that already bounds the V1 path.
++        if num_max_dispatch_tokens_per_rank <= 0:
++            num_max_dispatch_tokens_per_rank = (
++                envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
++            )
++        # `num_topk` is not known at buffer-construction time in SGLang
++        # (the router choice is per-forward). DeepEP V2 accepts
++        # `num_topk=0` and falls back to a group-size-based conservative
++        # hint, so we pass 0 here and let V2 compute the ceiling.
++        num_topk = 0
++        # Low-latency mode still requires `num_experts % group.size() ==
++        # 0`. The normal mode works with `num_experts == -1`.
++        if deepep_mode.enable_low_latency():
++            assert num_experts != -1 and num_experts % group.size() == 0
++
++        logger.info(
++            "SGLANG_DEEPEP_USE_V2=1: constructing deep_ep.ElasticBuffer "
++            "(num_max_tokens_per_rank=%d, hidden=%d, num_topk=%d).",
++            num_max_dispatch_tokens_per_rank,
++            hidden_size,
++            num_topk,
++        )
++        return ElasticBuffer(
++            group=group,
++            num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
++            hidden=hidden_size,
++            num_topk=num_topk,
++            use_fp8_dispatch=False,
++            allow_hybrid_mode=True,
++            # num_allocated_qps=0 -> V2 auto-sizes with an EFA safety cap
++            # (see deep_ep/buffers/elastic.py _is_efa_fabric()).
++            num_allocated_qps=0,
++        )
++
+     @classmethod
+     def clean_buffer(cls):
++        # DeepEP V2's `ElasticBuffer` does not expose `low_latency_mode`
++        # or `clean_low_latency_buffer` — low-latency cleanup is handled
++        # internally via `EPHandle` lifetime. Fall through for V2.
++        if not hasattr(cls._buffer, "clean_low_latency_buffer"):
++            return
+         if not cls._buffer.low_latency_mode:
+             return
+         cls._buffer.clean_low_latency_buffer(
+diff --git a/test/srt/test_deepep_v2_probe.py b/test/srt/test_deepep_v2_probe.py
+new file mode 100644
+index 000000000000..7eeae8dc59dd
+--- /dev/null
++++ b/test/srt/test_deepep_v2_probe.py
+@@ -0,0 +1,142 @@
++"""CPU-only unit test for the DeepEP V2 probe plumbing in
++`sglang.srt.layers.moe.token_dispatcher.deepep`.
++
++Exercises the three reachable probe states:
++
++1. V1 `Buffer` available, V2 `ElasticBuffer` missing
++2. V2 `ElasticBuffer` available, V1 `Buffer` also available (normal V2 install)
++3. Neither available
++
++The test does not execute any DeepEP kernels — it imports the module
++under a monkey-patched `deep_ep` stub so it runs on any CPU host without
++CUDA / NCCL / EFA. It is purely a guard against the probe pattern
++silently regressing.
++
++Run:
++    pytest -xvs test/srt/test_deepep_v2_probe.py
++"""
++
++from __future__ import annotations
++
++import importlib
++import sys
++import types
++import unittest
++from contextlib import contextmanager
++
++
++def _make_stub_deep_ep(*, with_buffer: bool, with_elastic_buffer: bool):
++    """Build a fake `deep_ep` module with the attributes we opt to expose."""
++
++    mod = types.ModuleType("deep_ep")
++    if with_buffer:
++
++        class _StubBuffer:  # noqa: D401 - placeholder class
++            num_sms = 20
++
++            @staticmethod
++            def get_dispatch_config(size):  # pragma: no cover - unused in test
++                return None
++
++            @staticmethod
++            def get_combine_config(size):  # pragma: no cover - unused in test
++                return None
++
++        mod.Buffer = _StubBuffer
++        mod.Config = object
++    if with_elastic_buffer:
++
++        class _StubElasticBuffer:  # noqa: D401 - placeholder class
++            pass
++
++        mod.ElasticBuffer = _StubElasticBuffer
++    return mod
++
++
++@contextmanager
++def _patched_deep_ep(*, with_buffer: bool, with_elastic_buffer: bool):
++    """Install a stub `deep_ep` in sys.modules and drop the SGLang
++    deepep module from the cache so it re-runs its imports against the
++    stub. Restores the original state on exit.
++    """
++
++    saved = {
++        k: sys.modules[k]
++        for k in list(sys.modules)
++        if k == "deep_ep" or k.startswith("deep_ep.")
++    }
++    saved_deepep = sys.modules.pop(
++        "sglang.srt.layers.moe.token_dispatcher.deepep", None
++    )
++    # Wipe the stub path
++    sys.modules.pop("deep_ep", None)
++    if with_buffer or with_elastic_buffer:
++        sys.modules["deep_ep"] = _make_stub_deep_ep(
++            with_buffer=with_buffer, with_elastic_buffer=with_elastic_buffer
++        )
++    try:
++        yield
++    finally:
++        # Best-effort restore; we don't try to rewind every transitive
++        # import that the probe triggered.
++        sys.modules.pop("deep_ep", None)
++        for k, v in saved.items():
++            sys.modules[k] = v
++        if saved_deepep is not None:
++            sys.modules["sglang.srt.layers.moe.token_dispatcher.deepep"] = saved_deepep
++
++
++class TestDeepEPV2Probe(unittest.TestCase):
++    """Guard the V2 probe plumbing against silent regression."""
++
++    def _import_probe_flags(self):
++        sys.modules.pop("sglang.srt.layers.moe.token_dispatcher.deepep", None)
++        mod = importlib.import_module("sglang.srt.layers.moe.token_dispatcher.deepep")
++        return (
++            getattr(mod, "use_deepep"),
++            getattr(mod, "have_deepep_v2"),
++        )
++
++    def test_v1_only_installed(self):
++        """Legacy install (V1 `Buffer` only). `use_deepep=True`,
++        `have_deepep_v2=False`. No regression on pre-V2 users."""
++        with _patched_deep_ep(with_buffer=True, with_elastic_buffer=False):
++            try:
++                use_deepep, have_v2 = self._import_probe_flags()
++            except ImportError:
++                # Test env may not have full sglang deps; that's fine,
++                # the probe itself is what we need to prove compiles.
++                self.skipTest("sglang module stack unavailable on test host")
++                return
++        self.assertTrue(use_deepep)
++        self.assertFalse(have_v2)
++
++    def test_v2_installed(self):
++        """V2 install (both `Buffer` legacy + `ElasticBuffer` exported).
++        `use_deepep=True`, `have_deepep_v2=True`. The V2 path is now
++        reachable behind `SGLANG_DEEPEP_USE_V2=1`."""
++        with _patched_deep_ep(with_buffer=True, with_elastic_buffer=True):
++            try:
++                use_deepep, have_v2 = self._import_probe_flags()
++            except ImportError:
++                self.skipTest("sglang module stack unavailable on test host")
++                return
++        self.assertTrue(use_deepep)
++        self.assertTrue(have_v2)
++
++    def test_neither_installed(self):
++        """deep_ep missing entirely. `use_deepep=False`,
++        `have_deepep_v2=False`. Module must still import cleanly so the
++        SGLang package can load on non-MoE targets."""
++        with _patched_deep_ep(with_buffer=False, with_elastic_buffer=False):
++            try:
++                use_deepep, have_v2 = self._import_probe_flags()
++            except ImportError:
++                self.skipTest("sglang module stack unavailable on test host")
++                return
++        self.assertFalse(use_deepep)
++        self.assertFalse(have_v2)
++
++
++if __name__ == "__main__":
++    unittest.main()
