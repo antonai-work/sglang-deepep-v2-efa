@@ -188,7 +188,15 @@ class DeepEPBuffer:
         # `get_combine_config` / `get_nvl_buffer_size_hint` /
         # `get_rdma_buffer_size_hint` calls). Gated behind an env var so
         # the default code path is byte-identical to V1.
-        if have_deepep_v2 and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false"):
+        # Wave 38.11: V2 ElasticBuffer is built ONLY for normal dispatch
+        # mode. V2 has no low-latency API surface. LL path must stay on
+        # legacy Buffer (see docs/framework-deep-reads/sglang.md:182-219).
+        if (
+            have_deepep_v2
+            and get_bool_env_var("SGLANG_DEEPEP_USE_V2", default="false")
+            and deepep_mode.enable_normal()
+            and not deepep_mode.enable_low_latency()
+        ):
             cls._buffer = cls._build_v2_buffer(
                 group,
                 hidden_size,
@@ -319,17 +327,37 @@ class DeepEPBuffer:
             hidden_size,
             num_topk,
         )
-        return ElasticBuffer(
+        # Wave 38.6: use_fp8_dispatch must match SGLang's quantize gate.
+        # SGLang's dispatch_a at line 517 quantizes hidden_states via
+        # sglang_per_token_group_quant_fp8 and returns (fp8_tensor, scale)
+        # tuple whenever NOT SGLANG_DEEPEP_BF16_DISPATCH. V2 ElasticBuffer
+        # must be constructed with the matching dtype mode so the C++
+        # runtime.dispatch binding accepts the tuple shape.
+        import os as _os
+        _fp8_dispatch = _os.environ.get("SGLANG_DEEPEP_BF16_DISPATCH", "0") != "1"
+        elastic = ElasticBuffer(
             group=group,
             num_max_tokens_per_rank=num_max_dispatch_tokens_per_rank,
             hidden=hidden_size,
             num_topk=num_topk,
-            use_fp8_dispatch=False,
+            use_fp8_dispatch=_fp8_dispatch,
             allow_hybrid_mode=True,
             # num_allocated_qps=0 -> V2 auto-sizes with an EFA safety cap
             # (see deep_ep/buffers/elastic.py _is_efa_fabric()).
             num_allocated_qps=0,
         )
+        # Wave 38.8 Path B: return raw ElasticBuffer. Dispatcher calls
+        # native V2 dispatch/combine directly (see _dispatch_core /
+        # _combine_core isinstance(buffer, ElasticBuffer) branches).
+        # The legacy V2CompatBuffer shim has been deprecated and is no
+        # longer wrapped here.
+        logger.info(
+            "Wave 38.8 Path B: returning raw ElasticBuffer "
+            "(num_experts=%d, num_max_tokens=%d).",
+            num_experts if num_experts != -1 else 0,
+            num_max_dispatch_tokens_per_rank,
+        )
+        return elastic
 
     @classmethod
     def clean_buffer(cls):
@@ -538,6 +566,68 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         previous_event,
     ):
         buffer = self._get_buffer()
+        # Wave 38.8 Path B: native V2 dispatch when buffer is ElasticBuffer.
+        # Cited lines from docs/framework-deep-reads/sglang.md:102-140.
+        # V2 infers layout internally -> DROP get_dispatch_layout.
+        # V2 accepts (fp8, scale) tuple under tuple arm (elastic.py:725-728).
+        # RENAME async_finish -> async_with_compute_stream.
+        # ADD num_experts, num_max_tokens_per_rank, num_sms=0, num_qps=0,
+        # do_expand=False (decode-safe layout per Megatron PR #4632
+        # fused_a2a.py:214-228).
+        import deep_ep as _deep_ep
+        _is_elastic = isinstance(buffer, getattr(_deep_ep, "ElasticBuffer", ()))
+        if _is_elastic:
+            _prev_evt = buffer.capture() if self.async_finish else None
+            _alloc_on_comm = _prev_evt is not None
+            _deepep_precompile_tp_barrier()
+            (
+                recv_x,
+                recv_topk_ids,
+                recv_topk_weights,
+                self.handle,
+                event,
+            ) = buffer.dispatch(
+                x,
+                topk_idx=topk_ids,
+                topk_weights=topk_weights,
+                num_experts=self.num_experts,
+                num_max_tokens_per_rank=(
+                    self.num_max_dispatch_tokens_per_rank
+                    if self.num_max_dispatch_tokens_per_rank > 0
+                    else envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
+                ),
+                num_sms=0,
+                num_qps=0,
+                previous_event=_prev_evt,
+                async_with_compute_stream=self.async_finish,
+                allocate_on_comm_stream=_alloc_on_comm,
+                # Wave 38.10: V2 consumes expert_alignment to pad
+                # handle.num_recv_tokens_per_expert_list to BLOCK_E
+                # boundary. Without it, deep_gemm ep_scatter asserts
+                # m_indices.shape[0] % BLOCK_E == 0 (kernels.py:747).
+                # Match V1 behavior at sglang:605 — 128 when deep_gemm
+                # JIT is on, 1 otherwise.
+                expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+                do_expand=False,
+            )
+            num_recv_tokens_per_expert = getattr(
+                self.handle, "num_recv_tokens_per_expert_list", None
+            )
+            get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
+                num_recv_tokens_per_expert,
+                num_tokens_per_rank=None,
+                num_tokens_per_rdma_rank=None,
+                num_tokens_per_expert=None,
+            )
+            return (
+                recv_x,
+                recv_topk_ids,
+                recv_topk_weights,
+                num_recv_tokens_per_expert,
+                event,
+            )
+
+        # Legacy V1 path (preserved for Buffer instances).
         (
             num_tokens_per_rank,
             num_tokens_per_rdma_rank,
@@ -551,10 +641,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             async_finish=self.async_finish,
             allocate_on_comm_stream=previous_event is not None,
         )
-        # FIXME: `handle` should be transmitted with tokens from dispatch to combine.
-        # However, doing this would incur an unknown synchronization error, but keeping
-        # `handle` as a member variable works.
-
         _deepep_precompile_tp_barrier()
         (
             recv_x,
@@ -583,7 +669,6 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             num_tokens_per_expert=num_tokens_per_expert,
         )
-
         return (
             recv_x,
             recv_topk_ids,
@@ -616,7 +701,35 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
+        # Wave 38.8 Path B: native V2 combine. Cited sglang.md:160-180.
+        # DROP config, RENAME async_finish -> async_with_compute_stream,
+        # ADD num_sms=0, num_qps=0 (reuse handle.num_sms per Megatron
+        # PR #4632 fused_a2a.py:379-387).
+        import deep_ep as _deep_ep
+        _is_elastic = isinstance(buffer, getattr(_deep_ep, "ElasticBuffer", ()))
         _deepep_precompile_tp_barrier()
+        if _is_elastic:
+            _prev_evt = buffer.capture() if self.async_finish else None
+            _alloc_on_comm = _prev_evt is not None
+            # Wave 38.11: thread num_sms/num_qps from handle to match the
+            # dispatch launch config. num_sms=0 in both sides causes V2 to
+            # pick independently; FP8+hybrid-mode dispatch may pick a value
+            # that combine's launch config can't reuse, causing
+            # CUDA 719 + NVLink barrier timeout at handle.hpp:86.
+            _h_num_sms = getattr(self.handle, "num_sms", 0) or 0
+            _h_num_qps = getattr(self.handle, "num_qps", 0) or 0
+            combined_x, _, event = buffer.combine(
+                x,
+                handle=self.handle,
+                topk_weights=None,
+                num_sms=_h_num_sms,
+                num_qps=_h_num_qps,
+                previous_event=_prev_evt,
+                async_with_compute_stream=self.async_finish,
+                allocate_on_comm_stream=_alloc_on_comm,
+            )
+            return combined_x, event
+
         combined_x, _, event = buffer.combine(
             x,
             self.handle,

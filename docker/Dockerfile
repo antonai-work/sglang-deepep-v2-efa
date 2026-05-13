@@ -74,21 +74,30 @@ RUN pip install --no-cache-dir --break-system-packages --no-deps --force-reinsta
 # The patch adds `have_deepep_v2` probe + `_build_v2_buffer` classmethod
 # + `SGLANG_DEEPEP_USE_V2=1` env gate. Only touches one file.
 # -----------------------------------------------------------------------------
+RUN mkdir -p /opt/harness
 COPY docker/deepep-v2-patched.py /tmp/deepep-v2-patched.py
+COPY docker/v2_compat_buffer.py /tmp/v2_compat_buffer.py
+# Wave 38.9: runtime patch script for ep_moe.layer.EPMoE.deprecate_flag
+COPY docker/patch_ep_moe_deprecate_flag.py /opt/harness/patch_ep_moe_deprecate_flag.py
 # Whole-file replace: overwrite the installed deepep.py with the PR #24443
 # fork-branch version (dmvevents/sglang @ deepep-v2-elasticbuffer-support).
-# Simpler + more reliable than `patch` which has path-prefix + multi-hunk
-# edge cases. The file is self-contained; no other sglang module needs
-# touching since PR #24443 only adds an env-gate + classmethod.
+# Wave 38.5: also drop v2_compat_buffer.py into the same token_dispatcher
+# package so the patched _build_v2_buffer can wrap ElasticBuffer in the
+# V1-compat shim (SGLang's _dispatch_core still calls V1 surface).
 RUN set -eux; \
     DEST=$(python3 -c "import sglang, os; print(os.path.join(os.path.dirname(sglang.__file__), 'srt/layers/moe/token_dispatcher/deepep.py'))"); \
+    DEST_DIR=$(dirname "${DEST}"); \
     echo "Installing PR #24443 deepep.py at ${DEST}"; \
     test -f "${DEST}"; \
     cp /tmp/deepep-v2-patched.py "${DEST}"; \
+    cp /tmp/v2_compat_buffer.py "${DEST_DIR}/v2_compat_buffer.py"; \
+    PY_SITE=$(python3 -c "import site; print(site.getsitepackages()[0])"); \
+    cp /tmp/v2_compat_buffer.py "${PY_SITE}/v2_compat_buffer.py"; \
     python3 -c "\
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer; \
 assert hasattr(DeepEPBuffer, '_build_v2_buffer'), 'PR #24443 V2 probe missing on DeepEPBuffer'; \
-print('[OK] sglang V2 probe installed (PR #24443 whole-file)')"
+from v2_compat_buffer import V2CompatBuffer; \
+print('[OK] sglang V2 probe + V2CompatBuffer shim installed')"
 
 # Step 5: Verify DeepEP V2 exports are available for the probe.
 RUN python3 -c "\
